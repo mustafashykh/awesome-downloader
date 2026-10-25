@@ -237,3 +237,48 @@ test('separate HLS video and audio produce an MP4 with both decodable tracks', a
     windowsHide: true,
   });
 });
+
+test('a video track in another codec is detected and converted to H.264', async () => {
+  const { videoCodec, convertVideoToH264 } = await import('../dist/core/mux.mjs');
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'awesome-h264-'));
+  const run = promisify(execFile);
+  const source = path.join(root, 'combined.mp4');
+
+  // Stands in for the AV1 YouTube's server can send. FFmpeg's built-in MPEG-4 encoder is
+  // used because not every ffmpeg-static build has an AV1 encoder (Windows lacks one).
+  await run(
+    ffmpeg,
+    [
+      '-v',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'testsrc=s=160x90:r=10:d=1',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=f=440:d=1',
+      '-c:v',
+      'mpeg4',
+      '-c:a',
+      'aac',
+      '-shortest',
+      source,
+    ],
+    { windowsHide: true },
+  );
+
+  const { signal } = new AbortController();
+  assert.equal(await videoCodec(source, signal), 'mpeg4');
+
+  const converted = await convertVideoToH264(root, source, signal);
+  assert.equal(await videoCodec(converted, signal), 'h264');
+
+  const { stderr } = await run(ffmpeg, ['-hide_banner', '-i', converted], {
+    windowsHide: true,
+  }).catch((error) => error);
+
+  assert.match(stderr, /Audio: aac/);
+  assert.match(stderr, /Duration: 00:00:01/);
+});
