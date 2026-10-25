@@ -1,0 +1,48 @@
+name: Publish release
+# Attaches the files from a finished "Build release candidates" run to a new
+# pre-release, without downloading and re-uploading them elsewhere.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: ID of the "Build release candidates" run to publish
+        required: true
+      target:
+        description: Commit the release tag points at (the run's commit)
+        required: true
+      tag:
+        description: Release tag, e.g. v0.1.0-macos-preview.1
+        required: true
+      title:
+        description: Release title
+        required: true
+      notes:
+        description: Release notes (Markdown)
+        required: true
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: assets
+          merge-multiple: true
+      - name: Create pre-release
+        # Inputs go through the environment so their text is never run as shell code.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          TARGET: ${{ inputs.target }}
+          TITLE: ${{ inputs.title }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          ls -l assets
+          gh release create "$TAG" assets/* --repo "$REPOSITORY" --target "$TARGET" \
+            --title "$TITLE" --notes "$NOTES" --prerelease
