@@ -15,6 +15,7 @@ download asset just because a local package command succeeds.
    download with audio, completion, update, and uninstall.
 5. Publish a **prerelease** until the clean-machine checks and known limitations
    are documented. Attach installer, checksums, notices, and required source assets.
+   The browser extension's store package comes from `yarn package:extension`.
 6. Never attach research, browser profiles, diagnostics with media URLs, or user data.
 7. Enable repository Issues and private vulnerability reporting. Review incoming
    pull requests; contributors do not need write/admin access to submit them.
