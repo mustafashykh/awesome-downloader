@@ -196,6 +196,31 @@ for (const mode of ['throw', 'reject']) {
   });
 }
 
+test('YouTube relay forwards page-copied streaming requests to the extension', async () => {
+  const sandbox = harness('youtube-relay.js', 'success');
+  const before = sandbox.calls;
+
+  await sandbox.events.get('message')({
+    source: sandbox.context.window,
+    origin: sandbox.context.location.origin,
+    data: {
+      type: 'awesome-sabr-request',
+      data: { url: 'https://r1.googlevideo.com/videoplayback?sabr=1', body: 'AQID' },
+    },
+  });
+
+  assert.equal(sandbox.calls, before + 1);
+
+  // Messages from other windows or origins are ignored.
+  await sandbox.events.get('message')({
+    source: {},
+    origin: sandbox.context.location.origin,
+    data: { type: 'awesome-sabr-request', data: { url: 'x', body: 'AQID' } },
+  });
+
+  assert.equal(sandbox.calls, before + 1);
+});
+
 test('missing runtime ID retires page scripts without sending again', () => {
   const sandbox = harness('content.js', 'success');
   sandbox.invalidate();

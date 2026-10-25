@@ -6,10 +6,11 @@ const path = require('node:path');
 
 const youtubeMedia = require('./youtube-media.js');
 
-function harness() {
+// Pass a previous harness's `data` to simulate Chrome restarting the service worker:
+// memory is lost, storage.session survives. `onTabMessage` sees messages sent to the page.
+function harness(data = {}, { onTabMessage } = {}) {
   const events = {};
   const nativeRequests = [];
-  const data = {};
 
   const event = (name) => ({
     addListener(fn) {
@@ -48,10 +49,16 @@ function harness() {
     action: {},
   };
 
-  browser.tabs.sendMessage = async () => ({ ok: true });
+  browser.tabs.sendMessage = async (tabId, message) => {
+    onTabMessage?.(message);
+    return { ok: true };
+  };
 
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'background.js'), 'utf8'), {
     browser,
+    // Retry waits run immediately so tests do not sleep.
+    setTimeout: (fn) => setImmediate(fn),
+    clearTimeout() {},
     URL,
     URLSearchParams,
     Uint8Array,
@@ -201,6 +208,16 @@ function observeSabrRequest(
   });
 }
 
+const settle = () =>
+  new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+
+const sabrItem = async (worker, sender) =>
+  (await worker.request({ action: 'listForFrame' }, sender)).items.find(
+    (value) => value.quality === '1080p',
+  );
+
 test('captured SABR request context is handed to the desktop with the selected tracks', async () => {
   const worker = harness();
   const sender = sabrSender();
@@ -245,6 +262,177 @@ test('captured SABR request context is handed to the desktop with the selected t
 
   assert.equal(rejected.ok, false);
   assert.equal(worker.nativeRequests.length, 2);
+});
+
+test('a SABR capture survives Chrome stopping the idle service worker', async () => {
+  const playing = harness();
+  const sender = sabrSender();
+  await playing.request(sabrPlayer(), sender);
+  observeSabrRequest(playing);
+  await settle();
+  // Paused video, ~30 s idle: Chrome stops the worker. Opening the menu wakes a new one,
+  // and the page's player data is sent again, but no new SABR request is made.
+  const restarted = harness(playing.data);
+  await restarted.request(sabrPlayer(), sender);
+  const item = await sabrItem(restarted, sender);
+
+  const result = await restarted.request(
+    { action: 'download', item: { ...item, startNow: true } },
+    sender,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(restarted.nativeRequests[0].sabr.requestBody, 'AQID');
+  assert.equal(restarted.nativeRequests[0].sabr.serverAbrStreamingUrl, sabrStream());
+});
+
+test('a missing capture is recovered automatically by priming the page player', async () => {
+  const sent = [];
+
+  const worker = harness(
+    {},
+    {
+      onTabMessage(message) {
+        sent.push(message.action);
+
+        // The page's player answers the nudge with a fresh streaming request.
+        if (message.action === 'primeStream') {
+          observeSabrRequest(worker);
+        }
+      },
+    },
+  );
+
+  const sender = sabrSender();
+  await worker.request(sabrPlayer(), sender);
+  const item = await sabrItem(worker, sender);
+
+  const result = await worker.request(
+    { action: 'download', item: { ...item, startNow: true } },
+    sender,
+  );
+
+  assert.equal(result.ok, true);
+  assert.ok(sent.includes('primeStream'));
+  assert.equal(worker.nativeRequests[0].sabr.requestBody, 'AQID');
+});
+
+test('a streaming request copied by the page is used when Chrome hides its body', async () => {
+  const sent = [];
+  const worker = harness({}, { onTabMessage: (message) => sent.push(message.action) });
+  const sender = sabrSender();
+  await worker.request(sabrPlayer(), sender);
+  // What Chrome reports today: the request is visible, its body is not.
+  worker.events.beforeRequest({ requestId: 'hidden', tabId: 8, url: sabrStream() });
+
+  const copied = await worker.request(
+    { action: 'sabrRequest', data: { url: sabrStream(), body: 'AQID' } },
+    sender,
+  );
+
+  assert.equal(copied.ok, true);
+  const item = await sabrItem(worker, sender);
+
+  const result = await worker.request(
+    { action: 'download', item: { ...item, startNow: true } },
+    sender,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(worker.nativeRequests[0].sabr.requestBody, 'AQID');
+  assert.equal(worker.nativeRequests[0].sabr.serverAbrStreamingUrl, sabrStream());
+  assert.ok(!sent.includes('primeStream'));
+});
+
+test('page-copied streaming requests are accepted only from YouTube for SABR URLs', async () => {
+  const worker = harness();
+
+  for (const [sender, data] of [
+    [
+      { id: 'extension-id', tab: { id: 8, url: 'https://example.com/watch?v=wLdZWyLOJCI' } },
+      { url: sabrStream(), body: 'AQID' },
+    ],
+    [sabrSender(), { url: 'https://example.com/videoplayback?sabr=1', body: 'AQID' }],
+    [sabrSender(), { url: sabrStream(), body: 'not base64!' }],
+  ]) {
+    assert.equal((await worker.request({ action: 'sabrRequest', data }, sender)).ok, false);
+  }
+
+  assert.doesNotMatch(JSON.stringify(worker.data), /AQID/);
+});
+
+test('an ad played in between keeps the main video capture', async () => {
+  const sent = [];
+  const worker = harness({}, { onTabMessage: (message) => sent.push(message.action) });
+  const sender = sabrSender();
+  await worker.request(sabrPlayer(), sender);
+  observeSabrRequest(worker, { requestId: 'main', body: [1, 2, 3] });
+  // A mid-roll ad brings its own player data and streaming requests into the same tab.
+  await worker.request(sabrPlayer('adVideo0001'), sender);
+  observeSabrRequest(worker, { requestId: 'ad', videoId: 'adVideo0001', body: [9, 9, 9] });
+  await worker.request(sabrPlayer(), sender);
+  const item = await sabrItem(worker, sender);
+
+  const result = await worker.request(
+    { action: 'download', item: { ...item, startNow: true } },
+    sender,
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(worker.nativeRequests[0].sabr.requestBody, 'AQID');
+  assert.equal(worker.nativeRequests[0].sabr.serverAbrStreamingUrl, sabrStream());
+  assert.ok(!sent.includes('primeStream'));
+});
+
+test('when recovery fails the message says what the extension saw', async () => {
+  const worker = harness();
+  const sender = sabrSender();
+  await worker.request(sabrPlayer(), sender);
+  // A streaming request whose body Chrome did not expose cannot be captured.
+  worker.events.beforeRequest({ requestId: 'no-body', tabId: 8, url: sabrStream() });
+  const item = await sabrItem(worker, sender);
+
+  const rejected = await worker.request(
+    { action: 'download', item: { ...item, startNow: true } },
+    sender,
+  );
+
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error, /requests seen in this tab: 1; without a readable body: 1/);
+  assert.equal(worker.nativeRequests.length, 0);
+});
+
+test('a stored SABR capture is never reused for a different video', async () => {
+  const playing = harness();
+  await playing.request(sabrPlayer(), sabrSender());
+  observeSabrRequest(playing);
+  await settle();
+  // After a restart, an in-page navigation to another video reports new player data
+  // without a previous player to compare against.
+  const restarted = harness(playing.data);
+  const other = sabrSender('abcdefghijk');
+  await restarted.request(sabrPlayer('abcdefghijk'), other);
+  const item = await sabrItem(restarted, other);
+
+  const rejected = await restarted.request(
+    { action: 'download', item: { ...item, startNow: true } },
+    other,
+  );
+
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error, /Could not capture this YouTube video's stream/);
+  assert.equal(restarted.nativeRequests.length, 0);
+});
+
+test('closing or reloading a tab removes its stored SABR capture', async () => {
+  const playing = harness();
+  await playing.request(sabrPlayer(), sabrSender());
+  observeSabrRequest(playing);
+  await settle();
+  assert.match(JSON.stringify(playing.data), /AQID/);
+  playing.events.updated(8, { status: 'loading' });
+  await settle();
+  assert.doesNotMatch(JSON.stringify(playing.data), /AQID/);
 });
 
 test('observing a video-only leaf never erases its master audio pairing', async () => {

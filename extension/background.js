@@ -6,22 +6,164 @@ if (typeof importScripts === 'function') {
 const api = globalThis.browser || chrome;
 const HOST = 'com.awesome.downloader';
 const CACHE_KEY = 'mediaByTab';
+// Chrome stops an idle service worker after about 30 seconds, so a capture made while the
+// video played must outlive it. storage.session is memory-only (never written to disk) and
+// is not readable by content scripts.
+const SABR_KEY = 'sabrByTab';
 let serial = Promise.resolve();
 // Credentials stay in worker memory and are used only for the selected observed URL.
 const requestContext = new Map();
+// Captured SABR requests are kept per tab and per stream: an ad or preview played in the
+// same tab must not replace the main video's capture.
 const youtubePlayers = new Map();
 const youtubeObserved = new Map();
 const youtubeSabrObserved = new Map();
 const youtubeSabrSeed = new Map();
+const youtubeSabrStats = new Map();
+const SABR_CAPTURES_PER_TAB = 5;
+const SABR_RETRY_POLLS = 40;
+const SABR_RETRY_INTERVAL_MS = 250;
 
 function clearSabrCapture(tabId) {
   youtubeSabrObserved.delete(tabId);
+  youtubeSabrStats.delete(tabId);
 
   for (const [id, seed] of youtubeSabrSeed) {
     if (seed.tabId === tabId) {
       youtubeSabrSeed.delete(id);
     }
   }
+
+  updateSession(SABR_KEY, ({ [tabId]: removed, ...others }) => others).catch(() => {});
+}
+
+// The googlevideo `id` parameter names the media asset, so it tells streams apart.
+const sabrStream = (value) => {
+  try {
+    return new URL(value).searchParams.get('id') || '';
+  } catch {
+    return '';
+  }
+};
+
+function sabrStats(tabId) {
+  let stats = youtubeSabrStats.get(tabId);
+
+  if (!stats) {
+    stats = { seen: 0, withoutBody: 0, fromPage: 0 };
+    youtubeSabrStats.set(tabId, stats);
+
+    if (youtubeSabrStats.size > 50) {
+      youtubeSabrStats.delete(youtubeSabrStats.keys().next().value);
+    }
+  }
+
+  return stats;
+}
+
+const watchVideoId = (value) => {
+  try {
+    const page = new URL(value);
+
+    if (!['www.youtube.com', 'youtube.com', 'm.youtube.com'].includes(page.hostname)) {
+      return null;
+    }
+
+    const id = page.searchParams.get('v') || /^\/shorts\/([\w-]{11})/.exec(page.pathname)?.[1];
+    return /^[\w-]{11}$/.test(id || '') ? id : null;
+  } catch {
+    return null;
+  }
+};
+
+// Each capture records its stream and the video the tab was showing.
+async function rememberSabrCapture(tabId, seed) {
+  const capture = {
+    ...seed,
+    stream: sabrStream(seed.url),
+    videoId: youtubePlayers.get(tabId)?.videoId,
+  };
+
+  const key = capture.stream || capture.url;
+  let captures = youtubeSabrObserved.get(tabId);
+
+  if (!captures) {
+    captures = new Map();
+    youtubeSabrObserved.set(tabId, captures);
+
+    if (youtubeSabrObserved.size > 50) {
+      youtubeSabrObserved.delete(youtubeSabrObserved.keys().next().value);
+    }
+  }
+
+  captures.delete(key);
+  captures.set(key, capture);
+
+  for (const old of [...captures.keys()].slice(0, -SABR_CAPTURES_PER_TAB)) {
+    captures.delete(old);
+  }
+
+  // The page address names the main video even while an ad plays, and a worker woken by
+  // this request has not yet seen the page's player data.
+  try {
+    capture.videoId = watchVideoId((await api.tabs.get(tabId)).url) || capture.videoId;
+  } catch {
+    // The tab may already be gone; keep the video ID from the player data.
+  }
+
+  await updateSession(SABR_KEY, (map) => {
+    // Re-adding the key moves it to the end, so the oldest captures are dropped first.
+    const { [key]: replaced, ...others } = map[tabId] || {};
+
+    const stored = Object.fromEntries(
+      Object.entries({ ...others, [key]: capture }).slice(-SABR_CAPTURES_PER_TAB),
+    );
+
+    return { ...map, [tabId]: stored };
+  });
+}
+
+// Prefer the capture of the player's own stream; fall back to one recorded on its page.
+function matchingCapture(captures, player) {
+  const newest = [...captures].reverse();
+  const stream = sabrStream(player.sabrUrl);
+  return (
+    (stream && newest.find((capture) => capture.stream === stream)) ||
+    newest.find((capture) => capture.videoId === player.videoId)
+  );
+}
+
+async function sabrCapture(tabId, player) {
+  const found = matchingCapture(youtubeSabrObserved.get(tabId)?.values() || [], player);
+
+  if (found) {
+    return found;
+  }
+
+  // After a worker restart, only session storage still has the earlier captures.
+  await serial;
+  const stored = (await api.storage.session.get(SABR_KEY))[SABR_KEY]?.[tabId];
+  return matchingCapture(Object.values(stored || {}), player);
+}
+
+// Instead of asking the user to play the video, have the page's player request its stream
+// again and wait for that request to be captured.
+async function waitForSabrCapture(tabId, player) {
+  await api.tabs.sendMessage(tabId, { action: 'primeStream' }).catch(() => {});
+
+  for (let attempt = 0; attempt < SABR_RETRY_POLLS; attempt += 1) {
+    await new Promise((resolve) => {
+      setTimeout(resolve, SABR_RETRY_INTERVAL_MS);
+    });
+
+    const captured = await sabrCapture(tabId, player);
+
+    if (captured) {
+      return captured;
+    }
+  }
+
+  return undefined;
 }
 
 function bytesBase64(bytes) {
@@ -40,21 +182,25 @@ api.webRequest.onBeforeRequest?.addListener(
     const url = globalThis.youtubeMedia?.sabrUrl(details.url);
     const raw = details.requestBody?.raw;
 
-    if (!url || details.tabId < 0 || !Array.isArray(raw) || !raw.length) {
+    if (!url || details.tabId < 0) {
       return;
     }
 
+    const stats = sabrStats(details.tabId);
+    stats.seen += 1;
     let size = 0;
 
-    for (const part of raw) {
+    for (const part of Array.isArray(raw) ? raw : []) {
       if (!part.bytes) {
-        return;
+        size = 0;
+        break;
       }
 
       size += part.bytes.byteLength;
     }
 
     if (!size || size > 262144) {
+      stats.withoutBody += 1;
       return;
     }
 
@@ -290,11 +436,13 @@ async function enqueue(item, tabId) {
             (format) => format.itag === videoItag && /^video\/mp4/i.test(format.mimeType),
           );
 
-    const captured = youtubeSabrObserved.get(tabId);
+    const captured =
+      (await sabrCapture(tabId, player)) || (await waitForSabrCapture(tabId, player));
 
     if (!captured) {
+      const stats = youtubeSabrStats.get(tabId) || { seen: 0, withoutBody: 0, fromPage: 0 };
       throw new Error(
-        'Play this YouTube video briefly so its streaming session can be captured, then try again.',
+        `Could not capture this YouTube video's stream. Reload the page, play the video for a few seconds, then try again. (Streaming requests seen in this tab: ${stats.seen}; without a readable body: ${stats.withoutBody}; copied by the page: ${stats.fromPage}.)`,
       );
     }
 
@@ -348,14 +496,18 @@ async function enqueue(item, tabId) {
   });
 }
 
-// `change` receives the stored map and returns the map to store.
 function updateCache(change) {
+  return updateSession(CACHE_KEY, change);
+}
+
+// `change` receives the stored map and returns the map to store.
+function updateSession(key, change) {
   const next = serial.then(async () => {
-    const data = await api.storage.session.get(CACHE_KEY);
-    const changed = await change(data[CACHE_KEY] || {});
+    const data = await api.storage.session.get(key);
+    const changed = await change(data[key] || {});
     // Bound total tracked tabs as well as each tab's results.
     const bounded = Object.fromEntries(Object.entries(changed).slice(-50));
-    await api.storage.session.set({ [CACHE_KEY]: bounded });
+    await api.storage.session.set({ [key]: bounded });
   });
 
   serial = next.catch(() => {});
@@ -448,14 +600,10 @@ api.webRequest.onHeadersReceived.addListener(
       const seed = youtubeSabrSeed.get(details.requestId);
 
       if (seed?.tabId === details.tabId && seed.url === capturedSabr) {
-        youtubeSabrObserved.set(details.tabId, seed);
+        rememberSabrCapture(details.tabId, seed).catch(() => {});
       }
 
       youtubeSabrSeed.delete(details.requestId);
-
-      if (youtubeSabrObserved.size > 50) {
-        youtubeSabrObserved.delete(youtubeSabrObserved.keys().next().value);
-      }
     }
 
     if (
@@ -558,6 +706,33 @@ api.runtime.onMessage.addListener((message, sender, respond) => {
   }
 
   const task = async () => {
+    // A copy of a successful streaming request, taken by the YouTube page script.
+    if (message.action === 'sabrRequest' && sender.tab) {
+      const page = new URL(sender.url || sender.tab.url || 'https://invalid.local');
+      const url = globalThis.youtubeMedia.sabrUrl(message.data?.url);
+      const body = String(message.data?.body || '');
+
+      if (
+        !['www.youtube.com', 'youtube.com', 'm.youtube.com'].includes(page.hostname) ||
+        !url ||
+        !body ||
+        body.length > 350000 ||
+        !/^[A-Za-z0-9+/]*={0,2}$/.test(body)
+      ) {
+        throw new Error('Invalid streaming request.');
+      }
+
+      sabrStats(sender.tab.id).fromPage += 1;
+
+      await rememberSabrCapture(sender.tab.id, {
+        tabId: sender.tab.id,
+        url,
+        requestBody: body,
+      });
+
+      return { ok: true };
+    }
+
     if (message.action === 'playerResponse' && sender.tab) {
       const page = new URL(sender.url || sender.tab.url || 'https://invalid.local');
 
@@ -576,8 +751,9 @@ api.runtime.onMessage.addListener((message, sender, respond) => {
       if (clean) {
         const previous = youtubePlayers.get(sender.tab.id);
 
+        // Captures are matched to their own stream, so they are kept when an ad's
+        // or preview's player data arrives in between.
         if (previous && previous.videoId !== clean.videoId) {
-          clearSabrCapture(sender.tab.id);
           youtubeObserved.delete(sender.tab.id);
         }
 
@@ -611,19 +787,15 @@ api.runtime.onMessage.addListener((message, sender, respond) => {
       const page = new URL(sender.tab.url || 'https://invalid.local');
 
       if (['www.youtube.com', 'youtube.com', 'm.youtube.com'].includes(page.hostname)) {
-        const id = page.searchParams.get('v') || /^\/shorts\/([\w-]{11})/.exec(page.pathname)?.[1];
+        const id = watchVideoId(page.href);
 
-        if (!/^[\w-]{11}$/.test(id || '')) {
+        if (!id) {
           return { ok: true, items: [] };
         }
 
         await api.tabs.sendMessage(sender.tab.id, { action: 'refreshPlayer' }).catch(() => {});
         const player = youtubePlayers.get(sender.tab.id);
-
-        const active =
-          player?.videoId === id
-            ? { ...player, sabrUrl: youtubeSabrObserved.get(sender.tab.id)?.url || player.sabrUrl }
-            : null;
+        const active = player?.videoId === id ? player : null;
 
         const items = active
           ? globalThis.youtubeMedia.choices(active, youtubeObserved.get(sender.tab.id) || [])
