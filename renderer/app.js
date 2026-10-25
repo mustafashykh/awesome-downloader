@@ -1416,7 +1416,10 @@ tableScroll.addEventListener('pointerdown', (event) => {
   };
 
   tableScroll.setPointerCapture(event.pointerId);
+  // preventDefault stops text selection during a drag, but also the click's usual focus;
+  // focus the list so the arrow, Home and End keys work after a click.
   event.preventDefault();
+  tableScroll.focus({ preventScroll: true });
 });
 
 tableScroll.addEventListener('pointermove', (event) => {
