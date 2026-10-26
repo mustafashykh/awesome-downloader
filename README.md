@@ -19,6 +19,11 @@ the desktop app.
 The installer is currently an unsigned preview. Browser video buttons require
 one manual "Load unpacked" setup; Chrome/Edge store listings are not available.
 
+A macOS preview is built as two DMGs, for Apple Silicon and Intel Macs. They are
+ad-hoc signed, not notarized, and built without the Hardened Runtime, so they are
+developer previews rather than normal Mac releases. See
+[macOS (preview)](docs/INSTALL.md#macos-preview) for what has and has not been tested.
+
 ## Features
 
 - HTTP(S) downloads with parallel ranges where the server supports them.
@@ -46,12 +51,10 @@ yarn start
 
 `yarn package` builds the unpacked application. `yarn dist` builds a local
 NSIS installer, without publishing. `yarn dist:portable` builds a portable
-executable. See [release requirements](docs/RELEASING.md) before distributing
-either. Current builds are unsigned and have no auto-updater.
-
-macOS support is preview groundwork: `yarn start` runs the app on an Apple Silicon
-Mac and registers the browser bridge for Chrome, Edge and Firefox, but no Mac
-package is built or published yet, and it has not been tested on Intel Macs.
+executable. On an Apple Silicon Mac, `yarn package:mac` builds the unpacked app
+and `yarn dist:mac` builds Apple Silicon (arm64) and Intel (x64) DMGs. See
+[release requirements](docs/RELEASING.md) before distributing any of them. Current
+builds are unsigned (ad-hoc signed on macOS) and have no auto-updater.
 
 The optional legacy extractor is described in [THIRD-PARTY.md](THIRD-PARTY.md).
 Do not commit its executable. `yarn install` installs the locked media dependencies.

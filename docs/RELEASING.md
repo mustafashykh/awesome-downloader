@@ -13,6 +13,15 @@ download asset just because a local package command succeeds.
 4. `yarn dist` builds an unsigned per-user NSIS installer. Test it on a clean
    Windows machine without Node.js: install, launch, extension setup, native handoff,
    download with audio, completion, update, and uninstall.
+   On an Apple Silicon Mac, `yarn dist:mac` builds ad-hoc signed, not notarized
+   arm64 and x64 DMGs. ffmpeg-static only installs the build machine's FFmpeg, so
+   `scripts/after-pack.cjs` downloads the other architecture's binary from the same
+   pinned ffmpeg-static release into the x64 app (check with `file` on
+   `Contents/Resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg`). Test
+   each DMG on a clean Mac of its architecture the same way, including the
+   first-launch **Open Anyway** step, and record the result before calling that
+   architecture supported. The release workflow does not include the optional
+   yt-dlp tool in Mac builds.
 5. Publish a **prerelease** until the clean-machine checks and known limitations
    are documented. Attach installer, checksums, notices, and required source assets.
 6. Never attach research, browser profiles, diagnostics with media URLs, or user data.
@@ -21,4 +30,6 @@ download asset just because a local package command succeeds.
 
 Current gates: GitHub authentication, dependency source-distribution audit,
 clean-machine installer QA, and first release publication. Code signing and browser
-store publication are not configured. Do not advertise them as available.
+store publication are not configured. macOS builds are ad-hoc signed, not
+notarized and built without the Hardened Runtime, and the Intel build has not been
+run on Intel hardware. Do not advertise any of these as available.
