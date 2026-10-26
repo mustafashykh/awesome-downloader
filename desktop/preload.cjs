@@ -32,4 +32,6 @@ api.onCommand = (callback) => {
   return () => ipcRenderer.removeListener('downloader:command', listener);
 };
 
+// Lets the page show the right keyboard shortcuts and setup steps.
+api.platform = process.platform;
 contextBridge.exposeInMainWorld('downloader', Object.freeze(api));

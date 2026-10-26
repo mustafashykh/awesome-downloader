@@ -35,7 +35,8 @@ selection does not invoke it. Firefox YouTube capture has not reached parity.
 
 ## Develop
 
-On Windows x64 with Node.js 22+ and Yarn 4 (run `corepack enable` once):
+On Windows x64 or an Apple Silicon Mac with Node.js 22+ and Yarn 4 (run
+`corepack enable` once):
 
 ```powershell
 yarn install
@@ -47,6 +48,10 @@ yarn start
 NSIS installer, without publishing. `yarn dist:portable` builds a portable
 executable. See [release requirements](docs/RELEASING.md) before distributing
 either. Current builds are unsigned and have no auto-updater.
+
+macOS support is preview groundwork: `yarn start` runs the app on an Apple Silicon
+Mac and registers the browser bridge for Chrome, Edge and Firefox, but no Mac
+package is built or published yet, and it has not been tested on Intel Macs.
 
 The optional legacy extractor is described in [THIRD-PARTY.md](THIRD-PARTY.md).
 Do not commit its executable. `yarn install` installs the locked media dependencies.

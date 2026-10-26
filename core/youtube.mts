@@ -182,9 +182,10 @@ export function choicesFromInfo(info: YtDlpInfo, url: string): YoutubeChoice[] {
 function executable() {
   // Packaged Electron sets these; plain Node and unpackaged `electron .` runs use vendor/.
   const electron = process as NodeJS.Process & { resourcesPath?: string; defaultApp?: boolean };
+  const name = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
   return process.versions.electron && electron.resourcesPath && !electron.defaultApp
-    ? path.join(electron.resourcesPath, 'tools', 'yt-dlp.exe')
-    : fileURLToPath(new URL('../../vendor/yt-dlp.exe', import.meta.url));
+    ? path.join(electron.resourcesPath, 'tools', name)
+    : fileURLToPath(new URL(`../../vendor/${name}`, import.meta.url));
 }
 
 export function youtubeError(raw: unknown): YoutubeError {
@@ -286,9 +287,20 @@ function run(
       error = (error + chunk).slice(-4000);
     });
 
-    child.on('error', (spawnError) => {
+    child.on('error', (spawnError: NodeJS.ErrnoException) => {
       clearTimeout(timer);
-      reject(spawnError);
+
+      // yt-dlp is an optional, separately supplied tool (see THIRD-PARTY.md).
+      reject(
+        spawnError.code === 'ENOENT'
+          ? Object.assign(
+              new Error(
+                'YouTube links pasted into the app need the optional yt-dlp tool, which is not included in this build. Use Download this video from the browser extension instead.',
+              ),
+              { code: 'YOUTUBE_EXTRACTOR_MISSING', statusCode: 422 },
+            )
+          : spawnError,
+      );
     });
 
     child.on('close', (code) => {
